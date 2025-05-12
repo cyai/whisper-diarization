@@ -1,0 +1,1 @@
+include src/whisper_diarization/nemo_msdd_configs/*.yaml
