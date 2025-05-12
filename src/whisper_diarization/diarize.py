@@ -1,10 +1,7 @@
-# src/whisper_diarization/diarize.py
-
 import logging
 import os
-import re
 import shutil
-import tempfile
+import re
 
 import faster_whisper
 import torch
@@ -21,176 +18,238 @@ from ctc_forced_aligner import (
 from deepmultilingualpunctuation import PunctuationModel
 from nemo.collections.asr.models.msdd_models import NeuralDiarizer
 
-from .helpers import (
-    cleanup,
+from helpers import (
     create_config,
     find_numeral_symbol_tokens,
     get_realigned_ws_mapping_with_punctuation,
     get_sentences_speaker_mapping,
-    get_speaker_aware_transcript,
     get_words_speaker_mapping,
     langs_to_iso,
     process_language_arg,
     punct_model_langs,
     whisper_langs,
-    write_srt,  # this returns the SRT text if given a file-like
 )
 
 def diarize(
-    audio_path: str,
-    language: str = None,
-    whisper_model: str = "medium.en",
-    batch_size: int = 8,
-    device: str = None,
-    stemming: bool = True,
-    suppress_numerals: bool = False,
+    audio_path: str, 
+    language: str = None, 
+    whisper_model: str = "medium.en", 
+    batch_size: int = 8, 
+    device: str = None, 
+    stemming: bool = True, 
+    suppress_numerals: bool = False
 ):
     """
-    Perform diarization + transcription on `audio_path` and return:
-      - `plain_text`: the full speaker-aware transcript as a single string
-      - `srt_text`: the SRT-format subtitles as a single string
+    Perform diarization and transcription on an audio file.
+    
+    Args:
+        audio_path (str): Path to the input audio file.
+        language (str, optional): Language spoken in the audio. 
+            Defaults to None (auto-detect).
+        whisper_model (str, optional): Name of the Whisper model to use. 
+            Defaults to "medium.en".
+        batch_size (int, optional): Batch size for batched inference. 
+            Defaults to 8. Set to 0 for original whisper longform inference.
+        device (str, optional): Device to use for processing. 
+            Defaults to cuda if available, else cpu.
+        stemming (bool, optional): Whether to perform source separation. 
+            Defaults to True.
+        suppress_numerals (bool, optional): Whether to suppress numerical digits. 
+            Defaults to False.
+    
+    Returns:
+        dict: A dictionary containing transcription details with speaker-aware transcript
     """
-
-    # 1) Setup
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    language = process_language_arg(language, whisper_model)
-    mtypes = {"cpu": "int8", "cuda": "float16"}
-
-    # use a unique temp dir for all intermediates
-    tmpdir = tempfile.mkdtemp(prefix="whisper_diar_temp_")
-
+    # Temporary path for processing
+    temp_path = os.path.join(os.getcwd(), "temp_outputs_" + os.path.basename(audio_path).replace('.', '_'))
+    
     try:
-        # 2) Optional source separation
+        # Set device
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Model type mapping
+        mtypes = {"cpu": "int8", "cuda": "float16"}
+        
+        # Process language argument
+        language = process_language_arg(language, whisper_model)
+        
+        # Stem audio if required
         if stemming:
-            ret = os.system(
-                f'python -m demucs.separate -n htdemucs --two-stems=vocals '
-                f'"{audio_path}" -o "{tmpdir}" --device "{device}"'
+            return_code = os.system(
+                f'python -m demucs.separate -n htdemucs --two-stems=vocals "{audio_path}" -o "{temp_path}" --device "{device}"'
             )
-            if ret == 0:
-                base = os.path.splitext(os.path.basename(audio_path))[0]
-                vocal_target = os.path.join(tmpdir, "htdemucs", base, "vocals.wav")
-            else:
-                logging.warning("Source splitting failed; using original audio.")
+            
+            if return_code != 0:
+                logging.warning(
+                    "Source splitting failed, using original audio file. "
+                    "Use stemming=False to disable it."
+                )
                 vocal_target = audio_path
+            else:
+                vocal_target = os.path.join(
+                    temp_path,
+                    "htdemucs",
+                    os.path.splitext(os.path.basename(audio_path))[0],
+                    "vocals.wav",
+                )
         else:
             vocal_target = audio_path
-
-        # 3) Whisper ASR
-        asr_model = faster_whisper.WhisperModel(
+        
+        # Ensure temp directory exists
+        os.makedirs(temp_path, exist_ok=True)
+        
+        # Transcribe the audio file
+        whisper_model_obj = faster_whisper.WhisperModel(
             whisper_model, device=device, compute_type=mtypes[device]
         )
-        asr_pipe = faster_whisper.BatchedInferencePipeline(asr_model)
-        waveform = faster_whisper.decode_audio(vocal_target)
-
+        whisper_pipeline = faster_whisper.BatchedInferencePipeline(whisper_model_obj)
+        audio_waveform = faster_whisper.decode_audio(vocal_target)
+        
+        # Suppress tokens for numerals if required
         suppress_tokens = (
-            find_numeral_symbol_tokens(asr_model.hf_tokenizer)
+            find_numeral_symbol_tokens(whisper_model_obj.hf_tokenizer)
             if suppress_numerals
             else [-1]
         )
-
+        
+        # Transcribe
         if batch_size > 0:
-            segments, info = asr_pipe.transcribe(
-                waveform, language,
+            transcript_segments, info = whisper_pipeline.transcribe(
+                audio_waveform,
+                language,
                 suppress_tokens=suppress_tokens,
                 batch_size=batch_size,
             )
         else:
-            segments, info = asr_model.transcribe(
-                waveform, language,
+            transcript_segments, info = whisper_model_obj.transcribe(
+                audio_waveform,
+                language,
                 suppress_tokens=suppress_tokens,
                 vad_filter=True,
             )
-
-        full_text = "".join(seg.text for seg in segments)
-
-        # free ASR
-        del asr_model, asr_pipe
+        
+        full_transcript = "".join(segment.text for segment in transcript_segments)
+        
+        # Clear GPU VRAM
+        del whisper_model_obj, whisper_pipeline
         torch.cuda.empty_cache()
-
-        # 4) Forced alignment
-        aln_model, aln_tokenizer = load_alignment_model(
+        
+        # Forced Alignment
+        alignment_model, alignment_tokenizer = load_alignment_model(
             device,
             dtype=torch.float16 if device == "cuda" else torch.float32,
         )
+        
         emissions, stride = generate_emissions(
-            aln_model,
-            torch.from_numpy(waveform)
-            .to(aln_model.dtype)
-            .to(aln_model.device),
+            alignment_model,
+            torch.from_numpy(audio_waveform)
+            .to(alignment_model.dtype)
+            .to(alignment_model.device),
             batch_size=batch_size,
         )
-        del aln_model
+        
+        del alignment_model
         torch.cuda.empty_cache()
-
+        
         tokens_starred, text_starred = preprocess_text(
-            full_text, romanize=True, language=langs_to_iso[info.language]
+            full_transcript,
+            romanize=True,
+            language=langs_to_iso[info.language],
         )
-        aln_segs, scores, blank = get_alignments(
-            emissions, tokens_starred, aln_tokenizer
+        
+        segments, scores, blank_token = get_alignments(
+            emissions,
+            tokens_starred,
+            alignment_tokenizer,
         )
-        spans = get_spans(tokens_starred, aln_segs, blank)
+        
+        spans = get_spans(tokens_starred, segments, blank_token)
+        
         word_timestamps = postprocess_results(text_starred, spans, stride, scores)
-
-        # 5) Prepare mono for NeMo diarization
-        mono_path = os.path.join(tmpdir, "mono_file.wav")
+        
+        # Convert audio to mono for NeMo compatibility
         torchaudio.save(
-            mono_path,
-            torch.from_numpy(waveform).unsqueeze(0).float(),
+            os.path.join(temp_path, "mono_file.wav"),
+            torch.from_numpy(audio_waveform).unsqueeze(0).float(),
             16000,
             channels_first=True,
         )
-
-        # 6) NeMo MSDD diarization
-        diar_model = NeuralDiarizer(cfg=create_config(tmpdir)).to(device)
-        diar_model.diarize()
-        del diar_model
+        
+        # Initialize NeMo MSDD diarization model
+        msdd_model = NeuralDiarizer(cfg=create_config(temp_path)).to(device)
+        msdd_model.diarize()
+        
+        del msdd_model
         torch.cuda.empty_cache()
-
-        # 7) Parse RTTM → speaker intervals
-        rttm_file = os.path.join(tmpdir, "pred_rttms", "mono_file.rttm")
+        
+        # Reading timestamps <> Speaker Labels mapping
         speaker_ts = []
-        with open(rttm_file) as f:
-            for line in f:
-                parts = line.split()
-                # skip invalid entries
-                if parts[5] == "<NA>":
-                    continue
-                start = float(parts[5]) * 1000
-                end = start + float(parts[8]) * 1000
-                spk = int(parts[11].split("_")[-1])
-                speaker_ts.append([int(start), int(end), spk])
-
+        with open(os.path.join(temp_path, "pred_rttms", "mono_file.rttm"), "r") as f:
+            lines = f.readlines()
+            for line in lines:
+                line_list = line.split(" ")
+                s = int(float(line_list[5]) * 1000)
+                e = s + int(float(line_list[8]) * 1000)
+                speaker_ts.append([s, e, int(line_list[11].split("_")[-1])])
+        
         wsm = get_words_speaker_mapping(word_timestamps, speaker_ts, "start")
-
-        # 8) Punctuation (optional)
+        
         if info.language in punct_model_langs:
-            punct = PunctuationModel(model="kredor/punctuate-all")
-            words = [w["word"] for w in wsm]
-            labels = punct.predict(words, chunk_size=230)
-            ending = ".?!"
-            is_acro = lambda x: re.fullmatch(r"\b(?:[A-Za-z]\.){2,}", x)
-            for wd, lbl in zip(wsm, labels):
-                if lbl[1] in ending and not is_acro(wd["word"]):
-                    wd["word"] = wd["word"].rstrip(".") + lbl[1]
-
+            # Restoring punctuation in the transcript to help realign the sentences
+            punct_model = PunctuationModel(model="kredor/punctuate-all")
+            
+            words_list = list(map(lambda x: x["word"], wsm))
+            
+            labled_words = punct_model.predict(words_list, chunk_size=230)
+            
+            ending_puncts = ".?!"
+            model_puncts = ".,;:!?"
+            
+            # We don't want to punctuate U.S.A. with a period. Right?
+            is_acronym = lambda x: re.fullmatch(r"\b(?:[a-zA-Z]\.){2,}", x)
+            
+            for word_dict, labeled_tuple in zip(wsm, labled_words):
+                word = word_dict["word"]
+                if (
+                    word
+                    and labeled_tuple[1] in ending_puncts
+                    and (word[-1] not in model_puncts or is_acronym(word))
+                ):
+                    word += labeled_tuple[1]
+                    if word.endswith(".."):
+                        word = word.rstrip(".")
+                    word_dict["word"] = word
+        
+        else:
+            logging.warning(
+                f"Punctuation restoration is not available for {info.language} language."
+                " Using the original punctuation."
+            )
+        
         wsm = get_realigned_ws_mapping_with_punctuation(wsm)
         ssm = get_sentences_speaker_mapping(wsm, speaker_ts)
-
-        # 9) Build outputs in memory
-        # Plain text: speaker-aware transcript
-        from io import StringIO
-        txt_buf = StringIO()
-        get_speaker_aware_transcript(ssm, txt_buf)
-        plain_text = txt_buf.getvalue()
-
-        # SRT: subtitles
-        srt_buf = StringIO()
-        write_srt(ssm, srt_buf)
-        srt_text = srt_buf.getvalue()
-
-        return plain_text, srt_text
-
+        
+        # Prepare return object
+        return {
+            'language': info.language,
+            'transcript': ssm,
+            'original_text': full_transcript
+        }
+    
+    except Exception as e:
+        logging.error(f"Diarization failed: {e}")
+        raise
+    
     finally:
-        # 10) Cleanup all temps
-        if os.path.exists(tmpdir):
-            shutil.rmtree(tmpdir, ignore_errors=True)
+        # Ensure cleanup of temporary files and directories
+        try:
+            if os.path.exists(temp_path):
+                shutil.rmtree(temp_path)
+        except Exception as cleanup_error:
+            logging.error(f"Error during cleanup: {cleanup_error}")
+
+# Example usage (commented out)
+# if __name__ == "__main__":
+#     result = diarize("/path/to/your/audio/file.wav")
+#     print(result)
