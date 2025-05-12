@@ -1,5 +1,2 @@
 huggingface_hub<0.24
 numpy<2
-git+https://github.com/MahmoudAshraf97/demucs.git
-git+https://github.com/oliverguhr/deepmultilingualpunctuation.git
-git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git
