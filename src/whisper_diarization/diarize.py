@@ -17,7 +17,7 @@ from ctc_forced_aligner import (
 from deepmultilingualpunctuation import PunctuationModel
 from nemo.collections.asr.models.msdd_models import NeuralDiarizer
 
-from helpers import (
+from .helpers import (
     cleanup,
     create_config,
     find_numeral_symbol_tokens,
